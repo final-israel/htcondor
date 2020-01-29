@@ -33,6 +33,7 @@
 #include <string>
 #include <map>
 #include <algorithm>
+#include <utility>
 
 /* FILESQL include */
 #include "file_sql.h"
@@ -322,6 +323,7 @@ class Matchmaker : public Service
 		friend int comparisonFunction (AttrList *, AttrList *,
 										void *);
 		bool pslotMultiMatch(ClassAd *job, ClassAd *machine, double preemptPrio, string &dslot_claims);
+		bool pslotQuotaMultiMatch(ClassAd *job, ClassAd *machine, string &dslot_claims);
 
 		/** trimStartdAds will throw out startd ads have no business being 
 			visible to the matchmaking engine, but were fetched from the 
@@ -352,13 +354,14 @@ class Matchmaker : public Service
 
 		void RegisterAttemptedOfflineMatch( ClassAd *job_ad, ClassAd *startd_ad );
 
+		void calculateSlotStats(ClassAdListDoesNotDeleteAds& startdAds);
 		void populateGroupUsageCache();
 		bool shouldPreemptByGroupQuota(const char* request_user,
 									   const char* remote_user);
 		bool getAncestorBrotherGroups(GroupEntry* g1, GroupEntry* g2,
 									  GroupEntry*& abg1, GroupEntry*& abg2);
 		bool isOverQuota(GroupEntry* group);
-		bool isUnderQuota(GroupEntry* group);
+		bool isUnderQuota(GroupEntry* group, float* by_how_much = NULL);
 		void printQuotaOverview();
 	
 		// configuration information
@@ -406,7 +409,10 @@ class Matchmaker : public Service
 		typedef HashTable<MyString, float> groupQuotasHashType;
 		groupQuotasHashType *groupQuotasHash;
         groupQuotasHashType *groupUsageHash;
- 
+
+		// slot name -> <slot weight, total run time>
+		map<string, std::pair<float, int> > slotStatHash;
+
 		// rank condition on matches
 		ExprTree *rankCondStd;// no preemption or machine rank-preemption 
 							  // i.e., (Rank > CurrentRank)

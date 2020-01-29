@@ -49,7 +49,7 @@
 #include <string>
 #include <deque>
 #include <sstream>
-
+#include <tuple>
 #if defined(WANT_CONTRIB) && defined(WITH_MANAGEMENT)
 #if defined(HAVE_DLOPEN)
 #include "NegotiatorPlugin.h"
@@ -1215,6 +1215,25 @@ compute_significant_attrs(ClassAdListDoesNotDeleteAds & startdAds)
 	return result;
 }
 
+void Matchmaker::calculateSlotStats(ClassAdListDoesNotDeleteAds& startdAds)
+{
+	slotStatHash.clear();
+	startdAds.Open();
+
+	while (ClassAd* ad = startdAds.Next()) {
+		string candidateName;
+		float slotWeight;
+		int	runtime = 0;
+		ad->LookupString(ATTR_NAME, candidateName);
+		ad->LookupInteger(ATTR_TOTAL_JOB_RUN_TIME, runtime);
+		if (candidateName.empty()) continue;
+		slotWeight = accountant.GetSlotWeight(ad);
+		slotStatHash[candidateName] = std::make_pair(slotWeight, runtime);
+		dprintf(D_FULLDEBUG, "calculateStartdAdSlotWeights: %s -> %f, %d\n", candidateName.c_str(), slotWeight,
+				runtime);
+	}
+}
+
 void Matchmaker::populateGroupUsageCache()
 {
     if (hgq_groups.size() <= 1) return;
@@ -1340,8 +1359,9 @@ bool Matchmaker::isOverQuota(GroupEntry* group)
     return usage > quota;
 }
 
-bool Matchmaker::isUnderQuota(GroupEntry* group)
+bool Matchmaker::isUnderQuota(GroupEntry* group, float* by_how_much)
 {
+	if (by_how_much != NULL) *by_how_much = 0.0;
     float quota = group->quota;
     float usage = 0.0;
     if (!groupUsageHash->lookup(group->name, usage) == -1) {
@@ -1351,6 +1371,10 @@ bool Matchmaker::isUnderQuota(GroupEntry* group)
     bool under = (usage + 0.9999) <= quota;
     dprintf(D_FULLDEBUG, "is under: group %s: usage %f, quota %f, under %d\n",
             group->name.c_str(), usage, quota, under);
+	if (by_how_much != NULL && under)
+	{
+		*by_how_much = (quota - usage);
+	}
     return under;
 }
 
@@ -1625,6 +1649,8 @@ negotiationTime ()
 	// insert RemoteUserPrio and related attributes so they are
 	// available during matchmaking
 	addRemoteUserPrios( startdAds );
+
+	calculateSlotStats(startdAds);
 
     if (hgq_groups.size() <= 1) {
         // If there is only one group (the root group) we are in traditional non-HGQ mode.
@@ -5275,12 +5301,23 @@ matchmakingAlgorithm(const char *scheddName, const char *scheddAddr, ClassAd &re
             cp_restore_requested(request, consumption);
         }
 
+		candidatePreemptState = NO_PREEMPTION;
+
 		candidateDslotClaims.clear();
 		bool pslotRankMatch = false;
 		if (!is_a_match && ConsiderPreemption) {
 			bool jobWantsMultiMatch = false;
 			request.LookupBool(ATTR_WANT_PSLOT_PREEMPTION, jobWantsMultiMatch);
-			if (param_boolean("ALLOW_PSLOT_PREEMPTION", false) && jobWantsMultiMatch) {
+			if (param_boolean("ALLOW_QUOTA_PSLOT_PREEMPTION", false) && jobWantsMultiMatch) {
+				is_a_match = pslotQuotaMultiMatch(&request, candidate, candidateDslotClaims);
+				if (is_a_match)
+				{
+					// so this match will be lower on the match list than
+					// non-preempting matches
+					candidatePreemptState = QUOTA_PREEMPTION;
+				}
+			}
+			else if (param_boolean("ALLOW_PSLOT_PREEMPTION", false) && jobWantsMultiMatch) {
 				is_a_match = pslotMultiMatch(&request, candidate, preemptPrio, candidateDslotClaims);
 				pslotRankMatch = is_a_match;
 			}
@@ -5303,8 +5340,6 @@ matchmakingAlgorithm(const char *scheddName, const char *scheddAddr, ClassAd &re
 				// they don't match; continue
 			continue;
 		}
-
-		candidatePreemptState = NO_PREEMPTION;
 
 		remoteUser.clear();
 			// If there is already a preempting user, we need to preempt that user.
@@ -7302,6 +7337,229 @@ Matchmaker::pslotMultiMatch(ClassAd *job, ClassAd *machine, double preemptPrio, 
 				//   sent to the schedd. That is where the claim id of the
 				//   pslot is cleared.
 				child_claims[ranks[child].first] = "";
+			}
+
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool slotCompare(std::tuple<int, string, double, int> lhs, std::tuple<int, string, double, int> rhs)
+{
+	return std::get<3>(lhs) < std::get<3>(rhs);
+}
+
+	// Return true is this partitionable slot would match the
+	// job with preempted resources from a dynamic slot.
+	// Only consider quota for this purpose.
+bool
+Matchmaker::pslotQuotaMultiMatch(ClassAd *job, ClassAd *machine, string &dslot_claims) {
+	dprintf(D_FULLDEBUG, "pslotQuotaMultiMatch: start\n");
+
+	bool isPartitionable = false;
+
+	machine->LookupBool(ATTR_SLOT_PARTITIONABLE, isPartitionable);
+
+	// This whole deal is only for partitionable slots
+	if (!isPartitionable) {
+		return false;
+	}
+
+	// How many active dslots does this pslot currently have?
+	int numDslots = 0;
+	machine->LookupInteger(ATTR_NUM_DYNAMIC_SLOTS, numDslots);
+
+	if (numDslots < 1) {
+		return false;
+	}
+
+	std::string name, ipaddr;
+
+	machine->LookupString(ATTR_NAME, name);
+	machine->LookupString(ATTR_MY_ADDRESS, ipaddr);
+		// Lookup the vector of claim ids for this startd
+	std::string hash_key = name + ipaddr;
+	std::vector<std::string> &child_claims = childClaimHash[hash_key];
+	if ( numDslots != (int)child_claims.size() ) {
+		dprintf( D_FULLDEBUG, "Wrong number of dslot claim ids for %s, ignoring for pslot preemption\n", name.c_str() );
+		return false;
+	}
+
+	// check whether the requested job's group is under quota
+	int request_cpus = 1;
+	string request_group;
+	job->LookupInteger(ATTR_REQUEST_CPUS, request_cpus);
+
+	if (job->LookupString(ATTR_SUBMITTER_GROUP, request_group))
+	{
+		request_group += ".";
+	}
+	string request_owner;
+	job->LookupString(ATTR_OWNER, request_owner);
+	request_group += request_owner;
+
+	float under_quota;
+	isUnderQuota(accountant.GetAssignedGroup(request_group + "@foo"), &under_quota);
+
+	dprintf(D_FULLDEBUG, "pslotQuotaMultiMatch: request owner %s, requested cpus %d, under_quota %f\n",
+			request_group.c_str(), request_cpus, under_quota);
+
+	if (under_quota < request_cpus)
+	{
+		dprintf(D_FULLDEBUG, "pslotQuotaMultiMatch: not enough quota for group (under %f)\n", under_quota);
+		return false;
+	}
+
+	// OK, the request has enough room under the quota limit, now let's find out
+	// if current jobs are over quota and whether preempting them can create
+	// space for the request
+
+	// algo:
+	// calculate quota over usage for each group
+	// order dslots by current job running time (ascending)
+	// for each dslot:
+	// - determine if can preempt according to quota surplus
+	// - determine whether we have enough space for the request now
+
+	typedef map<string, float> GroupOverMap;
+	GroupOverMap groups_over_quota;
+
+	vector<std::tuple<int, string, float, int> > slots; // <slot no, group, weight, runtime>
+
+	for (int i = 0; i < numDslots; ++i)
+	{
+		int retire_time = 0;
+		string state = "";
+		dslotLookupInteger( machine, ATTR_RETIREMENT_TIME_REMAINING, i,
+							retire_time );
+		dslotLookupString( machine, ATTR_STATE, i, state );
+
+		if ( retire_time > 0 ) {
+			continue;
+		}
+		if ( !strcmp( state.c_str(), state_to_string( preempting_state ) ) ) {
+			continue;
+		}
+		if ( child_claims[i] == "" ) {
+			continue;
+		}
+
+		string group;
+		dslotLookupString(machine, ATTR_ACCOUNTING_GROUP, i, group);
+		size_t pos = group.find('@');
+		pos = group.rfind('.', pos);
+		if (pos == string::npos) continue;
+		group = group.substr(0, pos);
+		groups_over_quota[group] = 0.0;
+
+		string candidate_name;
+		dslotLookupString( machine, ATTR_NAME, i, candidate_name);
+
+		std::pair<float, int>&  slot_stats = slotStatHash[candidate_name];
+		if (slot_stats.first == 0)
+		{
+			// 0 slot weight? let's skip this
+			continue;
+		}
+		dprintf(D_FULLDEBUG, "pslotQuotaMultiMatch: dslot %d, group %s, weight %f, runtime %d\n", i, group.c_str(),
+				slot_stats.first, slot_stats.second);
+		slots.push_back(std::make_tuple(i, group, slot_stats.first, slot_stats.second));
+	}
+
+	// sort by runtime (ascending)
+	std::sort(slots.begin(), slots.end(), slotCompare);
+	for (size_t i = 0; i < slots.size(); ++i)
+	{
+		dprintf(D_FULLDEBUG, "pslotQuotaMultiMatch: after sort: dslot %d\n", std::get<0>(slots[i]));
+	}
+
+	// calculate over-quota for each group in this pslot
+	for (GroupOverMap::iterator i = groups_over_quota.begin(); i != groups_over_quota.end(); ++i)
+	{
+		float usage, quota;
+		usage = quota = 0.0;
+		groupUsageHash->lookup(i->first, usage);
+		groupQuotasHash->lookup(i->first, quota);
+		i->second = usage - quota;
+		dprintf(D_FULLDEBUG, "pslotQuotaMultiMatch: group %s over %f\n", i->first.c_str(), i->second);
+	}
+
+	std::list<std::string> attrs;
+	std::string attrs_str;
+	if ( machine->LookupString( ATTR_MACHINE_RESOURCES, attrs_str ) ) {
+		StringList attrs_list( attrs_str.c_str(), " " );
+		attrs_list.rewind();
+		char *entry;
+		while ( (entry = attrs_list.next()) ) {
+			attrs.push_back( entry );
+		}
+	} else {
+		attrs.push_back("cpus");
+		attrs.push_back("memory");
+		attrs.push_back("disk");
+	}
+
+	ClassAd mutatedMachine(*machine); // make a copy to mutate
+	vector<int> good_slots; // keep all dslots which can be preempted here
+
+	for (size_t slot = 0; slot < slots.size(); ++slot)
+	{
+		int dslot;
+		string	group;
+		float 	weight;
+		std::tie(dslot, group, weight, std::ignore) = slots[slot];
+		float& over_quota = groups_over_quota[group];
+
+		if (weight > over_quota) continue;
+
+		// if we got here, this is a candidate for preemption
+		good_slots.push_back(dslot);
+		over_quota -= weight;
+		
+		dprintf(D_FULLDEBUG, "pslotQuotaMultiMatch: dslot %d is good\n", dslot);
+
+		// for each splitable resource, get it from the dslot, and add to pslot
+		for (std::list<std::string>::iterator it = attrs.begin(); it != attrs.end(); ++it)
+		{
+			double b4 = 0.0;
+			double realValue = 0.0;
+
+			if (mutatedMachine.LookupFloat((*it).c_str(), b4))
+			{
+				// The value exists in the parent
+				b4 = floor(b4);
+				classad::Value result;
+				if (!dslotLookup( machine, it->c_str(), dslot, result))
+					result.SetUndefinedValue();
+
+				int intValue;
+				if (result.IsIntegerValue(intValue))
+					mutatedMachine.Assign((*it).c_str(), (int) (b4 + intValue));
+				else if (result.IsRealValue(realValue))
+					mutatedMachine.Assign((*it).c_str(), (b4 + realValue));
+				else
+					dprintf(D_ALWAYS, "Lookup of %s failed to evalute to integer or real\n", (*it).c_str());	
+			}
+		}
+
+		// Now, check if it is a match
+		classad::MatchClassAd::UnoptimizeAdForMatchmaking(&mutatedMachine);
+		classad::MatchClassAd::UnoptimizeAdForMatchmaking(job);
+
+		if (IsAMatch(&mutatedMachine, job)) {
+			dprintf(D_FULLDEBUG, "Matched pslot by quota preempting %lu dynamic slots\n", good_slots.size());
+			dslot_claims.clear();
+
+			for (unsigned int i = 0; i < good_slots.size(); ++i) {
+				dslot_claims += child_claims[good_slots[i]];
+				dslot_claims += " ";
+				// TODO Move this clearing of claim ids to
+				//   matchmakingProcotol(), after the match is successfully
+				//   sent to the schedd. That is where the claim id of the
+				//   pslot is cleared.
+				child_claims[good_slots[i]] = "";
 			}
 
 			return true;
