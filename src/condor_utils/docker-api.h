@@ -48,7 +48,8 @@ class DockerAPI {
 						const std::list<std::string> extraVolumes,
 						int & pid,
 						int * childFDs,
-						CondorError & error );
+						CondorError & error,
+						int * affinity_mask = NULL);
 
 		static int startContainer(const std::string &name,
 						int &pid,
